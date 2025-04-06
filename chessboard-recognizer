@@ -1,0 +1,185 @@
+#!/usr/bin/env virtualenv-wrapper
+import virtualenv_wrapper
+if virtualenv_wrapper.begin_setup():
+    virtualenv_wrapper.install("requests")
+    virtualenv_wrapper.install("opencv-python")
+    virtualenv_wrapper.end_setup()
+
+import cv2
+import math
+import os
+import requests
+import sys
+import argparse
+
+def get_cache_home() -> str:
+    try:
+        return f'{os.environ['XDG_CACHE_HOME']}/.cache/chessboard-recognizer'
+    except KeyError:
+        try:
+            return f'{os.environ['HOME']}/.cache/chessboard-recognizer'
+        except KeyError:
+            raise AssertionError('Both environemntal variables XDG_CAHCE_HOME and HOME are not set. What kind of alien planet is this?')
+
+def download_chess_dot_com(dirpath: str):
+    for color in ["w", "b"]:
+        for piece in ["r", "n", "b", "k", "q", "p"]:
+            url = f"https://assets-themes.chess.com/image/ejgfv/150/{color}{piece}.png"
+            resp = requests.get(url)
+
+            filename = piece if color == "b" else piece.upper()
+            filepath = f"{dirpath}/chess.com/{filename}"
+            if os.path.exists(filepath):
+                continue
+
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            with open(filepath, "wb") as f:
+                f.write(resp.content)
+
+def download_assets(dirpath: str):
+    download_chess_dot_com(dirpath)
+
+# From https://stackoverflow.com/questions/5574702/how-do-i-print-to-stderr-in-python#14981125
+def eprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
+
+def load_board(board_path):
+    board = cv2.imread(board_path, cv2.IMREAD_UNCHANGED)
+    if board.shape[2] != 3:
+        eprint(f"Unexpected alpha channel in for board at {board_path}")
+        return
+
+    return board
+
+def load_resources(resource_dir):
+    resources = dict()
+    for source_name in os.listdir(resource_dir):
+        source_dir = os.path.join(resource_dir, source_name)
+        source = resources[source_name] = dict()
+        for piece_name in os.listdir(source_dir):
+            piece_path = os.path.join(source_dir, piece_name)
+            piece = source[piece_name] = cv2.imread(piece_path, cv2.IMREAD_UNCHANGED)
+            if piece.shape[2] != 4:
+                eprint(f"Missing alpha channel in for piece at {piece_path}")
+                return
+
+    return resources
+
+def slice_image(image, y1, x1, y2, x2):
+    """
+        Slice an image.
+
+        This differs from slicing with image[y1:y2,x1:x2,:] in that indices are
+        allowed to be negative in which case the image is automatically
+        zero-padded.
+    """
+    top = max(-y1, 0)
+    bottom = max(y2-image.shape[0], 0)
+
+    left = max(-x1, 0)
+    right = max(x2-image.shape[1], 0)
+
+    real_y1 = max(y1, 0)
+    real_x1 = max(x1, 0)
+
+    real_y2 = min(y2, image.shape[0])
+    real_x2 = min(x2, image.shape[1])
+
+    result = image[real_y1:real_y2,real_x1:real_x2,:]
+    result = cv2.copyMakeBorder(result, top, bottom, left, right, cv2.BORDER_CONSTANT)
+
+    assert result.shape[0] == y2 - y1
+    assert result.shape[1] == x2 - x1
+    return result
+
+def recognize_board_single(resources, board, tolerance, j, i):
+    for source_name, source in resources.items():
+        for piece_name, piece in source.items():
+            piece_height, piece_width = piece.shape[0:2]
+
+            y1 = int(math.floor(board.shape[0] * j / 8))
+            x1 = int(math.floor(board.shape[1] * i / 8))
+
+            y2 = int(math.ceil(board.shape[0] * (j + 1) / 8))
+            x2 = int(math.ceil(board.shape[1] * (i + 1) / 8))
+
+            ty1 = int(math.floor(board.shape[0] * (j - tolerance) / 8))
+            tx1 = int(math.floor(board.shape[1] * (i - tolerance) / 8))
+
+            ty2 = int(math.ceil(board.shape[0] * ((j + 1 + tolerance) / 8)))
+            tx2 = int(math.ceil(board.shape[1] * ((i + 1 + tolerance) / 8)))
+
+            cell_height = int(piece_height * (ty2 - ty1)  / (y2 - y1))
+            cell_width = int(piece_width * (tx2 - tx1)  / (x2 - x1))
+            cell = cv2.resize(slice_image(board, ty1, tx1, ty2, tx2), (cell_width, cell_height))
+
+            opaque_piece = piece[:,:,:3]
+
+            opaque_mask = opaque_piece.copy()
+            opaque_mask[piece[:,:,3] != 255] = [0, 0, 0]
+
+            result = cv2.matchTemplate(cell, opaque_piece, cv2.TM_SQDIFF_NORMED, mask=opaque_mask)
+            min_value, _, _, _ = cv2.minMaxLoc(result)
+            if min_value < 0.05:
+                return (source_name, piece_name)
+
+    return None
+
+def recognize_board(resources, board, tolerance):
+    return [[recognize_board_single(resources, board, tolerance, j, i) for i in range(8)] for j in range(8)]
+
+def result_to_fen(result, active_color: str, castling: str, en_passant: str, halfmove_clock: int, fullmove_number: int):
+    piece_placement = ""
+    for j in range(8):
+        if j != 0:
+            piece_placement += "/"
+
+        last_empty_count = 0
+
+        for i in range(8):
+            cell = result[j][i]
+            if cell is not None:
+                if last_empty_count != 0:
+                    piece_placement += str(last_empty_count)
+                    last_empty_count = 0
+
+                _, piece_name = cell
+                piece_placement += piece_name
+            else:
+                last_empty_count += 1
+
+        if last_empty_count != 0:
+            piece_placement += str(last_empty_count)
+            last_empty_count = 0
+
+    return f"{piece_placement} {active_color} {castling} {en_passant} {halfmove_clock} {fullmove_number}"
+
+def main():
+    parser = argparse.ArgumentParser(description="recognize and convert image of chessboard into fen notation")
+
+    parser.add_argument("chessboard_image", help="path to chessboard image")
+    parser.add_argument("--active-color", default='w')
+    parser.add_argument("--castling", default="-")
+    parser.add_argument("--en-passant", default="-")
+    parser.add_argument("--halfmove-clock", type=int, default=0)
+    parser.add_argument("--fullmove-number", type=int, default=1)
+
+    args = parser.parse_args()
+
+    cache_home = get_cache_home()
+    download_assets(cache_home)
+
+    resources = load_resources(cache_home)
+    if resources is None:
+        return
+
+    board = load_board(args.chessboard_image)
+    if board is None:
+        return
+
+    result = recognize_board(resources, board, 0.1)
+    fen = result_to_fen(result, args.active_color, args.castling, args.en_passant, args.halfmove_clock, args.fullmove_number)
+    print(fen)
+
+if __name__ == "__main__":
+    main()
