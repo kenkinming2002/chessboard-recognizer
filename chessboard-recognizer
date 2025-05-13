@@ -115,6 +115,11 @@ def recognize_board_single(resources, board, tolerance, j, i):
 
             opaque_piece = piece[:,:,:3]
 
+            # NOTE: It is important that we ignore any partially transparent
+            #       pixels (alpha != 255) and not just fully transparent pixels
+            #       (alpha == 0). Partially transparent pixels will blend with
+            #       the background and does not match the template. This leads
+            #       to variances in errors during template matching.
             opaque_mask = opaque_piece.copy()
             opaque_mask[piece[:,:,3] != 255] = [0, 0, 0]
 
